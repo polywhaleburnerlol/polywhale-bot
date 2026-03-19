@@ -1,0 +1,22 @@
+{
+  "dependencies": {
+    "@ethersproject/wallet": "^5.8.0",
+    "@polymarket/clob-client": "^5.5.0",
+    "@supabase/supabase-js": "^2.98.0",
+    "axios": "^1.9.0",
+    "dotenv": "^17.3.1",
+    "ethers": "^5.8.0",
+    "ws": "^8.19.0"
+  },
+  "name": "polywhale-local-engine",
+  "version": "1.0.0",
+  "description": "",
+  "main": "bot.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module"
+}
