@@ -48,6 +48,28 @@ async function sendTradeEmail({ to, market, outcome, side, size, price, orderId 
   }).catch(e => console.warn("[Resend]", e.message));
 }
 
+/* ─── Telegram trade notification ─── */
+async function sendTelegramMessage({ chatId, market, outcome, side, size, price, orderId }) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token || !chatId) return;
+  const emoji   = side === "BUY" ? "🟢" : "🔴";
+  const sizeStr = side === "BUY" ? `$${size} USDC` : `${size} shares`;
+  const text =
+    `${emoji} <b>Trade Executed — PolyWhale</b>\n\n` +
+    `📊 <b>Market:</b> ${market}\n` +
+    `🎯 <b>Outcome:</b> ${outcome}\n` +
+    `📈 <b>Side:</b> ${side}\n` +
+    `💰 <b>Size:</b> ${sizeStr}\n` +
+    `💲 <b>Fill Price:</b> $${price}\n` +
+    `🔑 <b>Order ID:</b> <code>${orderId}</code>\n\n` +
+    `<a href="https://dashboard.polywhale.app">View dashboard</a>`;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+  }).catch(e => L.warn(`[Telegram] ${e.message}`));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // §2  Configuration
 // ═════════════════════════════════════════════════════════════════════════════
@@ -406,6 +428,11 @@ async function executeCopyTrade(wt) {
         if (row.user_email) {
           sendTradeEmail({ to: row.user_email, market: title, outcome, side, size: amt, price: fillPrice, orderId: oid })
             .catch(e => L.warn(`[Email] ${e.message}`));
+        }
+
+        if (row.telegram_chat_id) {
+          sendTelegramMessage({ chatId: row.telegram_chat_id, market: title, outcome, side, size: amt, price: fillPrice, orderId: oid })
+            .catch(e => L.warn(`[Telegram] ${e.message}`));
         }
 
         if (process.env.DISCORD_WEBHOOK_URL) {
