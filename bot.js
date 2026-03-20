@@ -309,9 +309,24 @@ async function executeCopyTrade(wt) {
 
   const { data: clients, error } = await supabase.from("clients").select("*").eq("is_active", true);
   if (error) { L.error(`Supabase: ${error.message}`); return; }
-  if (!clients?.length) { L.warn("No active clients"); return; }
 
-  L.info(`📡 ${sideEmoji(side)} ${side} "${title}" [${outcome}] — ${clients.length} client(s)`);
+  L.info(`📡 ${sideEmoji(side)} ${side} "${title}" [${outcome}] — ${(clients || []).length} client(s)`);
+
+  // ── Discord whale alert — fires on every whale detection, not just fills ──
+  if (process.env.DISCORD_WEBHOOK_URL) {
+    const wp = parseFloat(price);
+    const emoji = side === "BUY" ? "🟢" : "🔴";
+    fetch(process.env.DISCORD_WEBHOOK_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content:
+        `${emoji} **WHALE ALERT**\n**${side}** ${title}\n` +
+        `Outcome: ${outcome} | Price: $${wp.toFixed(2)}\n` +
+        `Whale: ${wTag(whaleAddress)}`,
+      }),
+    }).catch(e => L.warn(`Discord: ${e.message}`));
+  }
+
+  if (!clients?.length) { L.warn("No active clients — skipping copy-trade"); return; }
 
   const mkt = await fetchMarketInfo(conditionId, asset);
   if (!mkt) { L.error(`No market info for ${conditionId}`); return; }
@@ -435,17 +450,6 @@ async function executeCopyTrade(wt) {
             .catch(e => L.warn(`[Telegram] ${e.message}`));
         }
 
-        if (process.env.DISCORD_WEBHOOK_URL) {
-          const sz = side === "SELL" ? `${fillShares || amt} shares` : `$${amt}`;
-          fetch(process.env.DISCORD_WEBHOOK_URL, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ content:
-              `** **WHALE ALERT**\n**${side}** ${title}\n` +
-              `Outcome: ${outcome} | Size: ${sz} @ $${fillPrice}\n` +
-              `Order: ${oid} | Whale: ${wTag(whaleAddress)} | ✅ FILLED`,
-            }),
-          }).catch(e => L.warn(`Discord: ${e.message}`));
-        }
       } else {
         const errDetail = resp?.error || resp?.errorMsg || JSON.stringify(resp);
         L.error(`${tag} — NOT confirmed: ${errDetail}`);
