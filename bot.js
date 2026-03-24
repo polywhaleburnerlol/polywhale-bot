@@ -493,6 +493,21 @@ async function executeCopyTrade(wt) {
   const { data: clients, error } = await supabase.from("clients").select("*").eq("is_active", true);
   if (error) { L.error(`Supabase: ${error.message}`); return; }
 
+  // ── Merge tier from profiles table so passesRules() can gate by tier ──
+  if (clients?.length) {
+    const emails = [...new Set(clients.map(c => c.user_email).filter(Boolean))];
+    if (emails.length) {
+      const { data: profiles } = await supabase
+        .from("profiles")
+        .select("email, tier")
+        .in("email", emails);
+      if (profiles?.length) {
+        const tierMap = Object.fromEntries(profiles.map(p => [p.email, p.tier]));
+        for (const c of clients) { c.tier = tierMap[c.user_email] ?? null; }
+      }
+    }
+  }
+
   L.info(`📡 ${sideEmoji(side)} ${side} "${title}" [${outcome}] — ${(clients || []).length} client(s)`);
 
   // ── Discord whale alert — fires on every whale detection, not just fills ──
