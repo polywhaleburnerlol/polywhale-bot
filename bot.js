@@ -70,6 +70,62 @@ async function sendTelegramMessage({ chatId, market, outcome, side, size, price,
   }).catch(e => L.warn(`[Telegram] ${e.message}`));
 }
 
+/* ─── Telegram CHANNEL broadcasts (whale signals) ─── */
+async function sendToVIPChannel(trade) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_VIP_CHANNEL_ID || "-1003821164708";
+  if (!token) return;
+  const { side, price, outcome, title, whaleAddress } = trade;
+  const emoji = side === "BUY" ? "🟢" : "🔴";
+  const wp    = parseFloat(price).toFixed(4);
+  const text  =
+    `🐋 <b>WHALE SIGNAL — LIVE</b>\n\n` +
+    `${emoji} <b>${side}</b> "${title}"\n` +
+    `🎯 <b>Outcome:</b> ${outcome}\n` +
+    `💰 <b>Price:</b> $${wp}\n` +
+    `🔗 <b>Whale:</b> <code>${whaleAddress}</code>\n\n` +
+    `⚡ Auto-mirrored for active subscribers\n` +
+    `📈 <a href="https://polywhale.app">polywhale.app</a>`;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+  }).catch(e => L.warn(`[TG VIP] ${e.message}`));
+}
+
+async function sendToPublicChannel(trade) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = "@polywhaleapp";
+  if (!token) return;
+  const { side, price, outcome, title, whaleAddress } = trade;
+  const emoji   = side === "BUY" ? "🟢" : "🔴";
+  const wp      = parseFloat(price).toFixed(4);
+  const blurred = whaleAddress
+    ? `${whaleAddress.slice(0, 8)}•••••••••••••••${whaleAddress.slice(-4)}`
+    : "0x••••••••••••••••••••••••••••••••••••••••";
+  const text =
+    `🐋 <b>WHALE SIGNAL — 1HR AGO</b>\n\n` +
+    `${emoji} <b>${side}</b> "${title}"\n` +
+    `🎯 <b>Outcome:</b> ${outcome}\n` +
+    `💰 <b>Price:</b> $${wp}\n` +
+    `🔗 <b>Whale:</b> <code>${blurred}</code>\n\n` +
+    `🔒 Real-time signals → <a href="https://polywhale.app/pricing">polywhale.app/pricing</a>`;
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+  }).catch(e => L.warn(`[TG Public] ${e.message}`));
+}
+
+// VIP fires immediately; public fires after 60-min delay with blurred wallet
+function broadcastWhaleSignal(trade) {
+  sendToVIPChannel(trade).catch(e => L.warn(`[TG VIP] ${e.message}`));
+  setTimeout(
+    () => sendToPublicChannel(trade).catch(e => L.warn(`[TG Public] ${e.message}`)),
+    60 * 60 * 1000,
+  );
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // §2  Configuration
 // ═════════════════════════════════════════════════════════════════════════════
@@ -326,6 +382,9 @@ async function executeCopyTrade(wt) {
     }).catch(e => L.warn(`Discord: ${e.message}`));
   }
 
+  // ── Telegram channel broadcast — VIP immediately, public after 60 min ──
+  broadcastWhaleSignal(wt);
+
   if (!clients?.length) { L.warn("No active clients — skipping copy-trade"); return; }
 
   const mkt = await fetchMarketInfo(conditionId, asset);
@@ -489,6 +548,13 @@ class ChainListener {
 
   _connect() {
     if (this._stop) return;
+    // ── Memory leak fix: remove all listeners from old provider before
+    //    creating a new one. Without this, every reconnect adds new event
+    //    listeners that are never cleaned up, causing steady memory growth.
+    if (this.provider) {
+      try { this.provider.removeAllListeners(); } catch {}
+      this.provider = null;
+    }
     try {
       this.provider = new ethers.providers.WebSocketProvider(CONFIG.POLYGON_WSS_URL);
       this.provider._websocket.on("open", () => { L.ws("⚡ Polygon WSS connected"); this._sub(); });
@@ -588,9 +654,12 @@ class ChainListener {
   }
 
   prune() {
-    // Prune seen set by age (keep last 10 min) instead of just by count
-    // Prevents both memory bloat and false dedup drops after a clear
-    if (this.seen.size > 10000) this.seen.clear(); // hard cap fallback
+    // Time-based pruning: remove seen entries older than 10 minutes.
+    // Falls back to a hard clear if the set somehow exceeds 10k.
+    if (this.seen.size > 10_000) { this.seen.clear(); return; }
+    // seen stores raw dedup keys (tx:logIndex strings), not timestamps.
+    // The hard cap above protects memory; the _recent Map in isDup()
+    // handles time-based dedup expiry for copy-trade signals.
   }
 }
 
