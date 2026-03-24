@@ -345,7 +345,134 @@ async function checkLiquidity(clob, asset, side, whalePrice, target) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// §9  Dedup
+// §9  Ghost Mode Rules Engine
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Keyword map for category matching against market titles.
+// Keys must match the values stored in client_rules.blocked_categories[].
+const CATEGORY_KEYWORDS = {
+  "Politics":            ["politic", "democrat", "republican", "govern", "senate", "congress", "president", "white house", "administration"],
+  "US Politics":         ["us politic", "trump", "biden", "harris", "maga", "gop ", "dnc ", "rnc "],
+  "Elections":           ["election", "vote", "ballot", "candidate", "primary", "electoral", "polling"],
+  "Crypto":              ["crypto", "blockchain", "defi", "web3", "altcoin", "memecoin", "stablecoin"],
+  "Bitcoin":             ["bitcoin", " btc ", "btc/", "satoshi"],
+  "Ethereum":            ["ethereum", " eth ", "eth/", "vitalik", "eip-"],
+  "Sports":              ["championship", "tournament", "season", "playoffs", "semifinal", "final", "league title"],
+  "Soccer / Football":   ["soccer", "premier league", "epl", "la liga", "champions league", "world cup", "fifa", "bundesliga", "serie a", "mls", "arsenal", "manchester", "chelsea", "liverpool", "barcelona", "real madrid", "psg", "juventus", "inter milan"],
+  "NBA":                 ["nba", "basketball", "lakers", "celtics", "warriors", "bulls", "heat ", "knicks", "bucks", "nets "],
+  "NFL":                 ["nfl", "super bowl", "touchdown", "quarterback", "patriots", "chiefs", "cowboys", "49ers", "eagles"],
+  "UFC / MMA":           ["ufc", " mma", "fight night", "knockout", "boxing match", "conor", "mcgregor", "adesanya", "jones "],
+  "Tennis":              ["tennis", "wimbledon", "us open", "french open", "australian open", "grand slam", "atp ", "wta ", "djokovic", "alcaraz", "sinner"],
+  "Golf":                ["golf", " pga ", "masters", "open championship", "ryder cup", "tiger woods"],
+  "Baseball (MLB)":      ["mlb", "baseball", "world series", "yankees", "dodgers", "mets ", "cubs ", "red sox"],
+  "Hockey (NHL)":        ["nhl", "hockey", "stanley cup", "ice rink"],
+  "Esports":             ["esport", "valorant", "league of legends", "cs:go", "csgo", "dota", "fortnite", "gaming tournament", "twitch"],
+  "Economics / Macro":   ["gdp", "inflation", "recession", "economy", "economic", " cpi ", "unemployment", "macro", "federal budget", "deficit", "trade war", "tariff"],
+  "Federal Reserve":     ["federal reserve", "fed funds", "fomc", "rate hike", "rate cut", "powell", "basis points", "bps", "interest rate"],
+  "Stocks & Equities":   ["stock market", "equity", "s&p 500", "nasdaq", "dow jones", " ipo ", "earnings", "share price", "market cap", "options expiry"],
+  "AI & Technology":     ["artificial intelligence", " ai ", "machine learning", "openai", "chatgpt", "llm ", "gpt-", "semiconductor", "nvidia", "microsoft", "apple stock", "google stock", "meta stock", "tech layoffs"],
+  "Science":             ["science", "research study", "discovery", "nasa", "space launch", "mars mission", "moon landing", "particle"],
+  "Geopolitics":         ["geopolit", " war ", "conflict", "sanctions", "diplomatic", "nato", "treaty", "military alliance", "arms"],
+  "Middle East":         ["middle east", "israel", "palestine", "iran ", "iraq ", "saudi", "gaza", "lebanon", "hamas", "hezbollah", "houthi", "west bank"],
+  "Russia / Ukraine":    ["russia", "ukraine", "putin", "zelensky", "kyiv", "kremlin", "donbas", "nato expansion"],
+  "China":               ["china ", "chinese", "beijing", "xi jinping", "taiwan", "hong kong", " pla ", "south china sea"],
+  "Climate & Weather":   ["climate", "hurricane", "tornado", "global warming", "carbon", "emission", "wildfire", "earthquake", "flood", "drought", "ice shelf"],
+  "Entertainment":       ["movie", " film ", "music album", "celebrity", "box office", "streaming", "netflix", "hollywood", "grammy", "chart-topping"],
+  "Awards / Oscars":     ["oscar", "academy award", "golden globe", "emmy award", "grammy award", "bafta", "sag award"],
+  "Legal / SCOTUS":      ["supreme court", "scotus", "court ruling", "lawsuit", "judge ", "verdict", "conviction", "indictment", "impeachment"],
+};
+
+// Check whether a trade passes this client's Ghost Mode rules.
+// Returns { pass: true } or { pass: false, reason: string }.
+// Fails OPEN — if Supabase errors, the trade goes through (never silently block real fills).
+async function passesRules(wt, clientRow, tradeAmountUsd) {
+  // Ghost Mode is a Market Maker exclusive feature — skip entirely for other tiers
+  if (clientRow.tier !== "market_maker") return { pass: true };
+  try {
+    const { data: rules, error } = await supabase
+      .from("client_rules")
+      .select("min_whale_size_usd, blocked_categories, max_exposure_usd")
+      .eq("client_id", clientRow.id)
+      .maybeSingle();
+
+    if (error) { L.warn(`passesRules DB: ${error.message} — allowing trade`); return { pass: true }; }
+    if (!rules) return { pass: true }; // No rules configured — mirror everything
+
+    const titleLower = (wt.title || "").toLowerCase();
+
+    // ── Rule 1: Minimum whale trade size ──────────────────────────────────
+    // Whale size from Data API is in shares; USD ≈ shares × price
+    if (rules.min_whale_size_usd > 0) {
+      const whaleUsd = parseFloat(wt.size || 0) * parseFloat(wt.price || 0);
+      if (whaleUsd < rules.min_whale_size_usd) {
+        return { pass: false, reason: `Whale size $${whaleUsd.toFixed(0)} < min $${rules.min_whale_size_usd}` };
+      }
+    }
+
+    // ── Rule 2: Blocked market categories ────────────────────────────────
+    if (rules.blocked_categories?.length > 0) {
+      for (const cat of rules.blocked_categories) {
+        const keywords = CATEGORY_KEYWORDS[cat] || [];
+        if (keywords.some(kw => titleLower.includes(kw.toLowerCase()))) {
+          return { pass: false, reason: `Category "${cat}" is blocked` };
+        }
+      }
+    }
+
+    // ── Rule 3: Max exposure per market (lifetime until resolution) ───────
+    if (rules.max_exposure_usd > 0) {
+      const { data: exp } = await supabase
+        .from("market_exposure")
+        .select("total_spent")
+        .eq("client_id", clientRow.id)
+        .eq("asset_id", wt.asset)
+        .maybeSingle();
+
+      const spent = parseFloat(exp?.total_spent || 0);
+      const tradeAmt = parseFloat(tradeAmountUsd || 0);
+      if (spent + tradeAmt > rules.max_exposure_usd) {
+        return { pass: false, reason: `Exposure cap $${rules.max_exposure_usd} reached ($${spent.toFixed(2)} already spent)` };
+      }
+    }
+
+    return { pass: true };
+  } catch (e) {
+    L.warn(`passesRules threw: ${e.message} — allowing trade`);
+    return { pass: true };
+  }
+}
+
+// Increment total_spent in market_exposure after a confirmed BUY fill.
+async function updateMarketExposure(clientId, assetId, marketTitle, amountSpent) {
+  try {
+    const { data: existing } = await supabase
+      .from("market_exposure")
+      .select("id, total_spent")
+      .eq("client_id", clientId)
+      .eq("asset_id", assetId)
+      .maybeSingle();
+
+    if (existing) {
+      await supabase
+        .from("market_exposure")
+        .update({
+          total_spent: existing.total_spent + parseFloat(amountSpent),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", existing.id);
+    } else {
+      await supabase.from("market_exposure").insert({
+        client_id: clientId, asset_id: assetId,
+        market_title: marketTitle, total_spent: parseFloat(amountSpent),
+      });
+    }
+  } catch (e) {
+    L.warn(`updateMarketExposure: ${e.message}`);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §10  Dedup
 // ═════════════════════════════════════════════════════════════════════════════
 const _recent = new Map();
 function isDup(asset, side) {
@@ -441,6 +568,17 @@ async function executeCopyTrade(wt) {
         return;
       }
 
+      // ── Ghost Mode Rules check ────────────────────────────────────────────
+      // Only applies to BUY (SELL is a position exit, rules don't restrict it)
+      if (side === "BUY") {
+        const rules = await passesRules(wt, row, amt);
+        if (!rules.pass) {
+          L.info(`${tag} — 👻 Ghost Mode blocked: ${rules.reason}`);
+          botLog("info", `Ghost Mode blocked: ${rules.reason}`, { clientId: row.id, meta: { asset, title, side } });
+          return;
+        }
+      }
+
       const clob = makeClobClient(dc);
       const liqTarget = side === "SELL" ? parseFloat(amt) * wp : dc.trade_amount_usd;
       if (!(await checkLiquidity(clob, asset, side, wp, liqTarget))) {
@@ -492,6 +630,12 @@ async function executeCopyTrade(wt) {
         };
         supabase.from("trades").insert(tradeRow)
           .then(({ error: e }) => { if (e) L.error(`${tag} DB: ${e.message}`); });
+
+        // ── Update market exposure tracking for BUY fills ──────────────────
+        if (side === "BUY") {
+          updateMarketExposure(row.id, asset, title, amt)
+            .catch(e => L.warn(`${tag} — exposure update: ${e.message}`));
+        }
 
         // ── Structured log for successful fill ──
         botLog("trade", `FILLED ${side} "${title}" [${outcome}]`, {
